@@ -298,15 +298,24 @@ static int regcache_rbtree_insert_to_block(struct regmap *map,
 
 	blk = krealloc(rbnode->block,
 		       blklen * map->cache_word_size,
-		       GFP_KERNEL);
+		       GFP_ATOMIC);
 	if (!blk)
 		return -ENOMEM;
 
-	present = krealloc(rbnode->cache_present,
-		    BITS_TO_LONGS(blklen) * sizeof(*present), GFP_KERNEL);
-	if (!present) {
-		kfree(blk);
-		return -ENOMEM;
+	if (BITS_TO_LONGS(blklen) > BITS_TO_LONGS(rbnode->blklen)) {
+		present = krealloc(rbnode->cache_present,
+				   BITS_TO_LONGS(blklen) * sizeof(*present),
+				   GFP_ATOMIC);
+		if (!present) {
+			kfree(blk);
+			return -ENOMEM;
+		}
+
+		memset(present + BITS_TO_LONGS(rbnode->blklen), 0,
+		       (BITS_TO_LONGS(blklen) - BITS_TO_LONGS(rbnode->blklen))
+		       * sizeof(*present));
+	} else {
+		present = rbnode->cache_present;
 	}
 
 	/* insert the register value in the correct place in the rbnode block */
@@ -333,7 +342,7 @@ regcache_rbtree_node_alloc(struct regmap *map, unsigned int reg)
 	const struct regmap_range *range;
 	int i;
 
-	rbnode = kzalloc(sizeof(*rbnode), GFP_KERNEL);
+	rbnode = kzalloc(sizeof(*rbnode), GFP_ATOMIC);
 	if (!rbnode)
 		return NULL;
 
@@ -359,12 +368,12 @@ regcache_rbtree_node_alloc(struct regmap *map, unsigned int reg)
 	}
 
 	rbnode->block = kmalloc(rbnode->blklen * map->cache_word_size,
-				GFP_KERNEL);
+				GFP_ATOMIC);
 	if (!rbnode->block)
 		goto err_free;
 
 	rbnode->cache_present = kzalloc(BITS_TO_LONGS(rbnode->blklen) *
-		sizeof(*rbnode->cache_present), GFP_KERNEL);
+		sizeof(*rbnode->cache_present), GFP_ATOMIC);
 	if (!rbnode->cache_present)
 		goto err_free_block;
 
