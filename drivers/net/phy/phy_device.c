@@ -179,7 +179,16 @@ struct phy_device *phy_device_create(struct mii_bus *bus, int addr, int phy_id,
 	dev->irq = bus->irq != NULL ? bus->irq[addr] : PHY_POLL;
 	dev_set_name(&dev->dev, PHY_ID_FMT, bus->id, addr);
 
-	dev->state = PHY_DOWN;
+	/* MJ: For LS1 IOT fixed link workaround check PHY address and hard code link as required */
+	if (addr != 2) {
+		dev->state = PHY_DOWN;
+	} else {
+		dev->state = PHY_UP;
+		dev->speed = SPEED_1000;
+		dev->duplex = DUPLEX_FULL;
+		dev->autoneg = AUTONEG_DISABLE;
+		dev->interface = PHY_INTERFACE_MODE_RGMII;
+	}
 
 	mutex_init(&dev->lock);
 	INIT_DELAYED_WORK(&dev->state_queue, phy_state_machine);
@@ -228,7 +237,7 @@ static int get_phy_c45_ids(struct mii_bus *bus, int addr, u32 *phy_id,
 	for (i = 1;
 	     i < num_ids && c45_ids->devices_in_package == 0;
 	     i++) {
-		reg_addr = MII_ADDR_C45 | i << 16 | 6;
+retry:		reg_addr = MII_ADDR_C45 | i << 16 | 6;
 		phy_reg = mdiobus_read(bus, addr, reg_addr);
 		if (phy_reg < 0)
 			return -EIO;
@@ -240,12 +249,25 @@ static int get_phy_c45_ids(struct mii_bus *bus, int addr, u32 *phy_id,
 			return -EIO;
 		c45_ids->devices_in_package |= (phy_reg & 0xffff);
 
-		/* If mostly Fs, there is no device there,
-		 * let's get out of here.
-		 */
-		if ((c45_ids->devices_in_package & 0x1fffffff) == 0x1fffffff) {
+		if ((i == 0) && (c45_ids->devices_in_package == 0)) {
 			*phy_id = 0xffffffff;
 			return 0;
+		}
+
+		if ((c45_ids->devices_in_package & 0x1fffffff) == 0x1fffffff) {
+			if (i) {
+				/*  If mostly Fs, there is no device there,
+				 *  then let's continue to probe more, as some
+				 *  10G PHYs have zero Devices In package,
+				 *  e.g. Cortina CS4315/CS4340 PHY.
+				 */
+				i = 0;
+				goto retry;
+			} else {
+				/* no device there, let's get out of here */
+				*phy_id = 0xffffffff;
+				return 0;
+			}
 		}
 	}
 
@@ -331,9 +353,12 @@ struct phy_device *get_phy_device(struct mii_bus *bus, int addr, bool is_c45)
 	if (r)
 		return ERR_PTR(r);
 
-	/* If the phy_id is mostly Fs, there is no device there */
-	if ((phy_id & 0x1fffffff) == 0x1fffffff)
-		return NULL;
+	/* MJ: For LS1 IOT fixed link check PHY addr and do not return NULL when no device */
+	if (addr != 2) {
+		/* If the phy_id is mostly Fs, there is no device there */
+		if ((phy_id & 0x1fffffff) == 0x1fffffff)
+			return NULL;
+	}
 
 	return phy_device_create(bus, addr, phy_id, is_c45, &c45_ids);
 }
@@ -534,16 +559,19 @@ static int phy_poll_reset(struct phy_device *phydev)
 
 int phy_init_hw(struct phy_device *phydev)
 {
-	int ret;
+	int ret = 0;
 
 	if (!phydev->drv || !phydev->drv->config_init)
 		return 0;
 
-	ret = phy_write(phydev, MII_BMCR, BMCR_RESET);
-	if (ret < 0)
-		return ret;
+	/* MJ: For LS1 IOT fixed link workaround reset phy*/
+	if (phydev->addr != 2) {
+		if (phydev->drv->soft_reset)
+			ret = phydev->drv->soft_reset(phydev);
+		else
+			ret = genphy_soft_reset(phydev);
+	}
 
-	ret = phy_poll_reset(phydev);
 	if (ret < 0)
 		return ret;
 
@@ -1029,6 +1057,27 @@ static int gen10g_read_status(struct phy_device *phydev)
 	return 0;
 }
 
+/**
+ * genphy_soft_reset - software reset the PHY via BMCR_RESET bit
+ * @phydev: target phy_device struct
+ *
+ * Description: Perform a software PHY reset using the standard
+ * BMCR_RESET bit and poll for the reset bit to be cleared.
+ *
+ * Returns: 0 on success, < 0 on failure
+ */
+int genphy_soft_reset(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = phy_write(phydev, MII_BMCR, BMCR_RESET);
+	if (ret < 0)
+		return ret;
+
+	return phy_poll_reset(phydev);
+}
+EXPORT_SYMBOL(genphy_soft_reset);
+
 static int genphy_config_init(struct phy_device *phydev)
 {
 	int val;
@@ -1072,6 +1121,12 @@ static int genphy_config_init(struct phy_device *phydev)
 	phydev->supported = features;
 	phydev->advertising = features;
 
+	return 0;
+}
+
+static int gen10g_soft_reset(struct phy_device *phydev)
+{
+	/* Do nothing for now */
 	return 0;
 }
 
@@ -1249,6 +1304,7 @@ static struct phy_driver genphy_driver[] = {
 	.phy_id		= 0xffffffff,
 	.phy_id_mask	= 0xffffffff,
 	.name		= "Generic PHY",
+	.soft_reset	= genphy_soft_reset,
 	.config_init	= genphy_config_init,
 	.features	= 0,
 	.config_aneg	= genphy_config_aneg,
@@ -1260,6 +1316,7 @@ static struct phy_driver genphy_driver[] = {
 	.phy_id         = 0xffffffff,
 	.phy_id_mask    = 0xffffffff,
 	.name           = "Generic 10G PHY",
+	.soft_reset	= gen10g_soft_reset,
 	.config_init    = gen10g_config_init,
 	.features       = 0,
 	.config_aneg    = gen10g_config_aneg,
